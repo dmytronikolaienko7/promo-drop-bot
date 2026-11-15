@@ -1,3 +1,35 @@
+"""PROMO DROP: local server and conservative public-post code discovery."""
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from html.parser import HTMLParser
+from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from pathlib import Path
+import json, re, time, os
+
+ROOT = Path(__file__).resolve().parent
+# Official Telegram feed plus an official news landing page. Other public Telegram
+# channels may be added via PROMO_EXTRA_CHANNELS (comma-separated HTTPS URLs).
+CHANNEL = 'https://t.me/s/play_standoff2'
+NEWS = 'https://standoff2.com/news'
+EXTRA = [u.strip() for u in os.environ.get('PROMO_EXTRA_CHANNELS', '').split(',') if u.strip()]
+SOURCES = [CHANNEL, NEWS] + [u for u in EXTRA if u.startswith('https://t.me/s/')]
+CACHE = {'at': 0, 'codes': [], 'sources': []}
+CODE_RE = re.compile(r'(?:промокод|промик|promo[ -]?code|secret code|секретн.{0,8}код)\s*(?:[-:–—=]|\s+)?\s*[`«"“]?([A-Z0-9]{5,24})\b', re.I)
+LABEL_RE = re.compile(r'промокод|промик|promo[ -]?code|secret code|секретн.{0,8}код', re.I)
+
+class Posts(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.depth=0; self.current=None; self.posts=[]; self.textdepth=0
+    def handle_starttag(self, tag, attrs):
+        a=dict(attrs); cls=a.get('class','')
+        if self.current is not None and tag=='div': self.depth+=1
+        if tag=='div' and 'tgme_widget_message_wrap' in cls and self.current is None:
+            self.current={'text':'','source':''};self.depth=1
+        if self.current is not None:
+            if tag=='div' and 'tgme_widget_message_text' in cls: self.textdepth=self.depth
+            if tag=='a' and 'tgme_widget_message_date' in cls: self.current['source']=a.get('href','')
+            if tag=='br' and self.textdepth: self.current['text']+='\n'
+    def handle_endtag(self,tag):
         if self.current is None:return
         if tag=='div':
             if self.textdepth==self.depth:self.textdepth=0
