@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: promo-drop-bot
+    runtime: python
+    plan: free
+    buildCommand: "python -m compileall -q server.py"
+    startCommand: "python server.py"
+    healthCheckPath: /health
