@@ -1,4 +1,4 @@
-"""PROMO BOT 3.0 — public Standoff 2 promo announcements (not in-game verification)."""
+"""PROMO BOT 3.1 — public Standoff 2 promo announcements (not in-game verification)."""
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import threading
 
 ROOT = Path(__file__).resolve().parent
 CHANNEL = 'https://t.me/s/play_standoff2'
@@ -18,6 +19,9 @@ EXTRA = [s.strip() for s in os.getenv('PROMO_EXTRA_CHANNELS', '').split(',') if 
 EXTRA = [s for s in EXTRA if re.fullmatch(r'https://t\.me/s/[A-Za-z0-9_]{5,32}', s)]
 SOURCES = list(dict.fromkeys([CHANNEL, NEWS] + EXTRA))
 CACHE = {'at': 0, 'codes': [], 'sources': []}
+LOCK = threading.RLock()
+REFRESH_SECONDS = max(300, int(os.getenv('PROMO_REFRESH_SECONDS', '600')))
+TELEGRAM_PAGES = max(1, min(10, int(os.getenv('PROMO_TELEGRAM_PAGES', '5'))))
 LABEL_RE = re.compile(r'промокод|промик|promo[ -]?code|secret code|секретн.{0,8}код', re.I)
 CODE_RE = re.compile(r'(?:промокод|промик|promo[ -]?code|secret code|секретн.{0,8}код)\s*(?:[-:–—=]|\s+)?\s*[`«"“]?([A-Z0-9]{5,24})\b', re.I)
 EXPIRED_RE = re.compile(r'(?:промокод|promo[ -]?code).{0,100}(?:термін дії (?:минув|закінчився)|expired|no longer valid)', re.I | re.S)
@@ -64,59 +68,93 @@ class Posts(HTMLParser):
         if self.current is not None and self.textdepth:
             self.current['text'] += data
 
-def discover():
-    if time.time() - CACHE['at'] < 600:
-        return CACHE['codes'], CACHE['sources']
+def fetch_page(url):
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; PromoDrop/3.1)'})
+    with urlopen(req, timeout=12) as response:
+        raw = response.read(1_500_001)
+    if len(raw) > 1_500_000:
+        raise ValueError('Сторінка завелика')
+    return raw.decode('utf-8', 'replace')
+
+def scan():
     found, checks = {}, []
     for url in SOURCES:
         try:
-            req = Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; PromoDrop/3.0)'})
-            with urlopen(req, timeout=12) as response:
-                raw = response.read(1_500_001)
-            if len(raw) > 1_500_000:
-                raise ValueError('Сторінка завелика')
-            posts = []
-            if url.startswith('https://t.me/s/'):
+            if not url.startswith('https://t.me/s/'):
+                fetch_page(url)
+                checks.append({'source': url, 'status': 'ok', 'posts': 0,
+                               'note': 'Доступність сторінки, не пошук у статтях'})
+                continue
+            channel_name = urlsplit(url).path.removeprefix('/s/')
+            seen = set()
+            before = None
+            pages = 0
+            while pages < TELEGRAM_PAGES:
+                page_url = url if before is None else url + '?before=' + str(before)
                 parser = Posts()
-                parser.feed(raw.decode('utf-8', 'replace'))
-                channel_name = urlsplit(url).path.removeprefix('/s/')
+                parser.feed(fetch_page(page_url))
                 posts = [p for p in parser.posts if re.fullmatch(
                     r'https://t\.me/' + re.escape(channel_name) + r'/\d+', p['source'])]
-            # The news landing page is checked for availability only; we do not
-            # pretend that its HTML navigation constitutes article content.
-            for post in posts:
-                content = post['text']
-                if not LABEL_RE.search(content):
-                    continue
-                for match in CODE_RE.finditer(content):
-                    code = match.group(1).upper()
-                    if code in {'STANDOFF', 'STANDOFF2', 'PROMO', 'PROMOCODE'}:
+                fresh = [p for p in posts if p['source'] not in seen]
+                if not fresh:
+                    break
+                pages += 1
+                for post in fresh:
+                    seen.add(post['source'])
+                    content = post['text']
+                    if not LABEL_RE.search(content):
                         continue
-                    official = (url == CHANNEL)
-                    expired = bool(EXPIRED_RE.search(content))
-                    item = {
-                        'code': code,
-                        'reward': 'Нагорода не підтверджена',
-                        'source': post['source'],
-                        'published_at': post['published_at'],
-                        'status': 'expired_reported' if expired else ('official_source' if official else 'unknown'),
-                        'source_official': official,
-                        'verified_in_game': False,
-                        'status_label': ('У публікації зазначено завершення дії' if expired else
-                                         'Опубліковано в офіційному джерелі' if official else
-                                         'Не перевірено'),
-                    }
-                    previous = found.get(code)
-                    if previous is None or (official and not previous['source_official']):
-                        found[code] = item
-            checks.append({'source': url, 'status': 'ok', 'posts': len(posts),
-                           'note': 'Доступність сторінки, не пошук у статтях' if url == NEWS else 'Переглянуто публікації'})
+                    for match in CODE_RE.finditer(content):
+                        code = match.group(1).upper()
+                        if code in {'STANDOFF', 'STANDOFF2', 'PROMO', 'PROMOCODE'}:
+                            continue
+                        official = (url == CHANNEL)
+                        expired = bool(EXPIRED_RE.search(content))
+                        item = {
+                            'code': code,
+                            'reward': 'Нагорода не підтверджена',
+                            'source': post['source'],
+                            'published_at': post['published_at'],
+                            'status': 'expired_reported' if expired else ('official_source' if official else 'unknown'),
+                            'source_official': official,
+                            'verified_in_game': False,
+                            'status_label': ('У публікації зазначено завершення дії' if expired else
+                                             'Опубліковано в офіційному джерелі; дію не перевірено' if official else
+                                             'Не перевірено'),
+                        }
+                        previous = found.get(code)
+                        if previous is None or (official and not previous['source_official']):
+                            found[code] = item
+                ids = [int(p['source'].rsplit('/', 1)[-1]) for p in posts]
+                if not ids:
+                    break
+                oldest = min(ids)
+                if before is not None and oldest >= before:
+                    break
+                before = oldest
+            checks.append({'source': url, 'status': 'ok', 'posts': len(seen),
+                           'pages': pages, 'note': 'Переглянуто публікації; коди не перевірені у грі'})
         except Exception as exc:
             checks.append({'source': url, 'status': 'error', 'message': str(exc)[:180]})
     if not any(c['status'] == 'ok' for c in checks):
         raise RuntimeError('Усі джерела недоступні')
-    CACHE.update(at=time.time(), codes=list(found.values()), sources=checks)
+    with LOCK:
+        CACHE.update(at=time.time(), codes=list(found.values()), sources=checks)
     return CACHE['codes'], CACHE['sources']
+
+def discover():
+    with LOCK:
+        if CACHE['at'] and time.time() - CACHE['at'] < REFRESH_SECONDS:
+            return CACHE['codes'], CACHE['sources']
+    return scan()
+
+def background_refresh():
+    while True:
+        try:
+            scan()
+        except Exception as exc:
+            print('Refresh error:', str(exc), flush=True)
+        time.sleep(REFRESH_SECONDS)
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -144,17 +182,18 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/health':
-            return self.send_json({'status': 'ok', 'version': '3.0'})
+            return self.send_json({'status': 'ok', 'version': '3.1'})
         if path == '/api/codes':
             try:
                 codes, sources = discover()
                 return self.send_json({'codes': codes, 'source': CHANNEL, 'sources': sources,
-                                       'verified_in_game': False, 'version': '3.0'})
+                                       'verified_in_game': False, 'version': '3.1'})
             except Exception as exc:
                 return self.send_json({'error': 'Не вдалося перевірити джерела: ' + str(exc)}, 503)
         return super().do_GET()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '8000'))
-    print(f'PROMO BOT 3.0 listening on {port}', flush=True)
+    print(f'PROMO BOT 3.1 listening on {port}', flush=True)
+    threading.Thread(target=background_refresh, daemon=True).start()
     ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
